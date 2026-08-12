@@ -7,6 +7,7 @@ import android.graphics.Color;
 import android.graphics.Matrix;
 import android.graphics.RectF;
 import android.os.Bundle;
+import android.os.SystemClock;
 import android.util.Log;
 import android.util.Size;
 import android.view.Gravity;
@@ -22,6 +23,8 @@ import androidx.camera.core.CameraSelector;
 import androidx.camera.core.ImageAnalysis;
 import androidx.camera.core.ImageProxy;
 import androidx.camera.core.Preview;
+import androidx.camera.core.resolutionselector.ResolutionSelector;
+import androidx.camera.core.resolutionselector.ResolutionStrategy;
 import androidx.camera.lifecycle.ProcessCameraProvider;
 import androidx.camera.view.PreviewView;
 import androidx.core.app.ActivityCompat;
@@ -42,13 +45,18 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
 public class MainActivity extends AppCompatActivity {
     private static final String TAG = "CamTrack";
     private static final int CAMERA_REQUEST = 1001;
-    /** Detector input is upscaled to at least this size so far-away vehicles stay detectable. */
-    private static final int MIN_CROP_SIZE = 480;
+    /**
+     * EfficientDet-Lite0 runs at 320x320 internally, so anything larger is
+     * downscaled here (cheap) instead of inside the graph (expensive).
+     * Upscaling adds zero information and only costs latency.
+     */
+    private static final int DETECTOR_INPUT = 320;
 
     private PreviewView previewView;
     private OverlayView overlayView;
@@ -60,17 +68,23 @@ public class MainActivity extends AppCompatActivity {
     private final VehicleTracker tracker = new VehicleTracker();
     private final ExecutorService cameraExecutor = Executors.newSingleThreadExecutor();
     private final AtomicLong frameStamp = new AtomicLong(0L);
+    /** Drops frames while inference is still running: always work on the freshest frame. */
+    private final AtomicBoolean inFlight = new AtomicBoolean(false);
     private volatile boolean destroyed = false;
     private volatile RectF roi = new RectF(0.1f, 0.15f, 0.9f, 0.85f);
 
-    // Geometry of the frame that produced the pending detection.
+    // Geometry of the frame that produced the pending detection (upright pixels).
     private volatile int frameWidth = 0;
     private volatile int frameHeight = 0;
     private volatile float cropLeft = 0f;
     private volatile float cropTop = 0f;
-    private volatile float cropScaleX = 1f;
-    private volatile float cropScaleY = 1f;
-    private volatile int detectedInLastSecond = 0;
+    private volatile float cropScale = 1f;
+    private volatile int detectedInLastFrame = 0;
+    private volatile long lastLatencyMs = 0L;
+    private volatile long inferenceStart = 0L;
+
+    // Reused buffers so we stop allocating a full-frame bitmap 30x per second.
+    private Bitmap rawBuffer;
 
     @Override protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -208,26 +222,35 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void setupDetector() {
+        detector = createDetector(Delegate.GPU);
+        if (detector == null) detector = createDetector(Delegate.CPU);
+        if (detector == null) {
+            statusText.setText("AI gagal dimuat • kamera tetap tersedia");
+        } else {
+            statusText.setText("AI aktif • deteksi di dalam kotak");
+        }
+    }
+
+    private ObjectDetector createDetector(Delegate delegate) {
         try {
             BaseOptions baseOptions = BaseOptions.builder()
                     .setModelAssetPath("efficientdet_lite0.tflite")
-                    .setDelegate(Delegate.CPU)
+                    .setDelegate(delegate)
                     .build();
             ObjectDetector.ObjectDetectorOptions options = ObjectDetector.ObjectDetectorOptions.builder()
                     .setBaseOptions(baseOptions)
                     .setRunningMode(RunningMode.LIVE_STREAM)
-                    .setMaxResults(25)
-                    .setScoreThreshold(0.28f)
-                    .setCategoryAllowlist(Arrays.asList("car", "motorcycle", "bus", "truck", "bicycle"))
+                    .setMaxResults(12)
+                    .setScoreThreshold(0.32f)
+                    // bicycle removed: it was being reported as a motorcycle and wrecked accuracy
+                    .setCategoryAllowlist(Arrays.asList("car", "motorcycle", "bus", "truck"))
                     .setResultListener((ObjectDetectorResult result, MPImage input) -> onDetection(result))
                     .setErrorListener(error -> Log.e(TAG, "Detector error", error))
                     .build();
-            detector = ObjectDetector.createFromOptions(this, options);
-            statusText.setText("AI aktif • deteksi di dalam kotak");
+            return ObjectDetector.createFromOptions(this, options);
         } catch (Throwable t) {
-            detector = null;
-            Log.e(TAG, "Detector initialization failed", t);
-            statusText.setText("AI gagal dimuat • kamera tetap tersedia");
+            Log.w(TAG, "Detector init failed on " + delegate, t);
+            return null;
         }
     }
 
@@ -236,8 +259,12 @@ public class MainActivity extends AppCompatActivity {
         provider.unbindAll();
         Preview preview = new Preview.Builder().build();
         preview.setSurfaceProvider(previewView.getSurfaceProvider());
+        ResolutionSelector resolution = new ResolutionSelector.Builder()
+                .setResolutionStrategy(new ResolutionStrategy(
+                        new Size(960, 540), ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER))
+                .build();
         ImageAnalysis analysis = new ImageAnalysis.Builder()
-                .setTargetResolution(new Size(1280, 720))
+                .setResolutionSelector(resolution)
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
                 .build();
@@ -254,53 +281,84 @@ public class MainActivity extends AppCompatActivity {
         try {
             ObjectDetector d = detector;
             if (d == null || destroyed) return;
+            // Skip this frame if the previous inference has not returned yet.
+            if (!inFlight.compareAndSet(false, true)) return;
 
-            Bitmap upright = toUprightBitmap(imageProxy);
-            if (upright == null) return;
+            boolean submitted = false;
+            try {
+                Bitmap raw = toBitmap(imageProxy);
+                if (raw == null) return;
 
-            final int w = upright.getWidth();
-            final int h = upright.getHeight();
-            frameWidth = w;
-            frameHeight = h;
-            if (roiView != null) {
-                final int aw = w, ah = h;
-                roiView.post(() -> roiView.setSourceAspect(aw, ah));
+                final int rotation = imageProxy.getImageInfo().getRotationDegrees();
+                final boolean swap = rotation == 90 || rotation == 270;
+                final int rawW = raw.getWidth();
+                final int rawH = raw.getHeight();
+                final int upW = swap ? rawH : rawW;
+                final int upH = swap ? rawW : rawH;
+                frameWidth = upW;
+                frameHeight = upH;
+                if (roiView != null) roiView.post(() -> roiView.setSourceAspect(upW, upH));
+
+                RectF r = roi;
+                int left = clamp((int) (r.left * upW), 0, upW - 2);
+                int top = clamp((int) (r.top * upH), 0, upH - 2);
+                int right = clamp((int) (r.right * upW), left + 2, upW);
+                int bottom = clamp((int) (r.bottom * upH), top + 2, upH);
+
+                // Crop in raw sensor space first, then rotate only the crop.
+                // Rotating the full frame first was the single biggest source of lag.
+                int rl, rt, rr, rb;
+                if (rotation == 90) {
+                    rl = top;            rt = rawH - right;  rr = bottom;        rb = rawH - left;
+                } else if (rotation == 270) {
+                    rl = rawW - bottom;  rt = left;          rr = rawW - top;    rb = right;
+                } else if (rotation == 180) {
+                    rl = rawW - right;   rt = rawH - bottom; rr = rawW - left;   rb = rawH - top;
+                } else {
+                    rl = left;           rt = top;           rr = right;         rb = bottom;
+                }
+                rl = clamp(rl, 0, rawW - 2);
+                rt = clamp(rt, 0, rawH - 2);
+                rr = clamp(rr, rl + 2, rawW);
+                rb = clamp(rb, rt + 2, rawH);
+
+                Bitmap crop = Bitmap.createBitmap(raw, rl, rt, rr - rl, rb - rt);
+                if (rotation != 0) {
+                    Matrix matrix = new Matrix();
+                    matrix.postRotate(rotation);
+                    crop = Bitmap.createBitmap(crop, 0, 0, crop.getWidth(), crop.getHeight(), matrix, false);
+                }
+
+                // Downscale (never upscale) to the detector's native input size.
+                float scale = 1f;
+                int longSide = Math.max(crop.getWidth(), crop.getHeight());
+                if (longSide > DETECTOR_INPUT) {
+                    scale = DETECTOR_INPUT / (float) longSide;
+                    crop = Bitmap.createScaledBitmap(crop,
+                            Math.max(2, Math.round(crop.getWidth() * scale)),
+                            Math.max(2, Math.round(crop.getHeight() * scale)), false);
+                }
+
+                cropLeft = left;
+                cropTop = top;
+                cropScale = 1f / scale;
+
+                inferenceStart = SystemClock.uptimeMillis();
+                d.detectAsync(new BitmapImageBuilder(crop).build(), frameStamp.incrementAndGet());
+                submitted = true;
+            } finally {
+                if (!submitted) inFlight.set(false);
             }
-
-            RectF r = roi;
-            int left = clamp((int) (r.left * w), 0, w - 2);
-            int top = clamp((int) (r.top * h), 0, h - 2);
-            int right = clamp((int) (r.right * w), left + 2, w);
-            int bottom = clamp((int) (r.bottom * h), top + 2, h);
-            int cw = right - left;
-            int ch = bottom - top;
-
-            Bitmap crop = Bitmap.createBitmap(upright, left, top, cw, ch);
-
-            // Upscale small crops so distant vehicles fill enough pixels to be detected.
-            float upscale = 1f;
-            int minSide = Math.min(cw, ch);
-            if (minSide < MIN_CROP_SIZE) {
-                upscale = Math.min(3f, MIN_CROP_SIZE / (float) minSide);
-                crop = Bitmap.createScaledBitmap(crop, Math.round(cw * upscale), Math.round(ch * upscale), true);
-            }
-
-            cropLeft = left;
-            cropTop = top;
-            cropScaleX = 1f / upscale;
-            cropScaleY = 1f / upscale;
-
-            MPImage mpImage = new BitmapImageBuilder(crop).build();
-            d.detectAsync(mpImage, frameStamp.incrementAndGet());
         } catch (Throwable t) {
+            inFlight.set(false);
             Log.w(TAG, "Frame analysis failed", t);
         } finally {
             imageProxy.close();
         }
     }
 
-    /** RGBA_8888 ImageProxy -> Bitmap rotated to upright orientation. */
-    private Bitmap toUprightBitmap(ImageProxy imageProxy) {
+    /** RGBA_8888 ImageProxy -> Bitmap in raw sensor orientation, reusing one buffer. */
+    private Bitmap toBitmap(ImageProxy imageProxy) {
         try {
             ImageProxy.PlaneProxy plane = imageProxy.getPlanes()[0];
             ByteBuffer buffer = plane.getBuffer();
@@ -311,19 +369,16 @@ public class MainActivity extends AppCompatActivity {
             int height = imageProxy.getHeight();
             int paddedWidth = rowStride / Math.max(1, pixelStride);
 
-            Bitmap bitmap = Bitmap.createBitmap(paddedWidth, height, Bitmap.Config.ARGB_8888);
-            bitmap.copyPixelsFromBuffer(buffer);
+            Bitmap buf = rawBuffer;
+            if (buf == null || buf.getWidth() != paddedWidth || buf.getHeight() != height) {
+                buf = Bitmap.createBitmap(paddedWidth, height, Bitmap.Config.ARGB_8888);
+                rawBuffer = buf;
+            }
+            buf.copyPixelsFromBuffer(buffer);
             if (paddedWidth != width) {
-                bitmap = Bitmap.createBitmap(bitmap, 0, 0, width, height);
+                return Bitmap.createBitmap(buf, 0, 0, width, height);
             }
-
-            int rotation = imageProxy.getImageInfo().getRotationDegrees();
-            if (rotation != 0) {
-                Matrix matrix = new Matrix();
-                matrix.postRotate(rotation);
-                bitmap = Bitmap.createBitmap(bitmap, 0, 0, bitmap.getWidth(), bitmap.getHeight(), matrix, true);
-            }
-            return bitmap;
+            return buf;
         } catch (Throwable t) {
             Log.w(TAG, "Bitmap conversion failed", t);
             return null;
@@ -335,16 +390,17 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void onDetection(ObjectDetectorResult result) {
+        inFlight.set(false);
         if (destroyed || result == null) return;
         try {
+            lastLatencyMs = SystemClock.uptimeMillis() - inferenceStart;
             final int w = frameWidth;
             final int h = frameHeight;
             if (w <= 0 || h <= 0) return;
 
-            float offsetX = cropLeft;
-            float offsetY = cropTop;
-            float scaleX = cropScaleX;
-            float scaleY = cropScaleY;
+            final float offsetX = cropLeft;
+            final float offsetY = cropTop;
+            final float scale = cropScale;
 
             List<VehicleTracker.DetectionInput> inputs = new ArrayList<>();
             for (Detection detection : result.detections()) {
@@ -355,26 +411,27 @@ public class MainActivity extends AppCompatActivity {
                 if (label == null) continue;
                 RectF box = new RectF(detection.boundingBox());
                 RectF mapped = new RectF(
-                        offsetX + box.left * scaleX,
-                        offsetY + box.top * scaleY,
-                        offsetX + box.right * scaleX,
-                        offsetY + box.bottom * scaleY);
+                        offsetX + box.left * scale,
+                        offsetY + box.top * scale,
+                        offsetX + box.right * scale,
+                        offsetY + box.bottom * scale);
                 if (mapped.width() < 8f || mapped.height() < 8f) continue;
                 inputs.add(new VehicleTracker.DetectionInput(label, category.score(), mapped));
             }
 
-            detectedInLastSecond = inputs.size();
-            List<VehicleTracker.TrackedVehicle> vehicles = tracker.update(inputs, w, h, 0);
+            detectedInLastFrame = inputs.size();
+            List<VehicleTracker.TrackedVehicle> vehicles = tracker.update(inputs, w, h);
+            final long latency = lastLatencyMs;
             runOnUiThread(() -> {
                 if (destroyed) return;
                 overlayView.setVehicles(vehicles);
                 int cars = 0, motors = 0;
                 for (VehicleTracker.TrackedVehicle v : vehicles) {
-                    if ("car".equals(v.label)) cars++;
-                    else if ("motorcycle".equals(v.label)) motors++;
+                    if (!v.fresh) continue;
+                    if ("motorcycle".equals(v.label)) motors++; else cars++;
                 }
                 countText.setText(String.format("MOBIL %d   •   MOTOR %d   •   TOTAL %d", cars, motors, cars + motors));
-                statusText.setText(String.format("AI aktif • %d objek di dalam kotak", detectedInLastSecond));
+                statusText.setText(String.format("AI aktif • %d objek • %d ms/frame", detectedInLastFrame, latency));
             });
         } catch (Throwable t) {
             Log.w(TAG, "Detection result failed", t);
@@ -385,7 +442,7 @@ public class MainActivity extends AppCompatActivity {
     private static String normalize(String raw) {
         if (raw == null) return null;
         String label = raw.toLowerCase();
-        if (label.contains("motor") || label.contains("bicycle") || label.contains("scooter")) return "motorcycle";
+        if (label.contains("motorcycle") || label.contains("motorbike") || label.contains("scooter")) return "motorcycle";
         if (label.contains("car") || label.contains("bus") || label.contains("truck") || label.contains("van")) return "car";
         return null;
     }
@@ -406,6 +463,7 @@ public class MainActivity extends AppCompatActivity {
             detector = null;
         }
         tracker.clear();
+        rawBuffer = null;
         cameraExecutor.shutdownNow();
         super.onDestroy();
     }
