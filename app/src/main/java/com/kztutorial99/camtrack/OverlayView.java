@@ -42,10 +42,10 @@ public final class OverlayView extends View {
             boxPaint.setAlpha(vehicle.fresh ? 255 : 130);
             canvas.drawRect(rect, boxPaint);
 
-            // Only a confirmed, currently visible vehicle gets a DB id printed.
-            String label = vehicle.fresh
-                    ? String.format("DB-%02d  %s  %.0f%%", vehicle.id, motor ? "MOTOR" : "MOBIL", vehicle.score * 100f)
-                    : (motor ? "MOTOR" : "MOBIL");
+            // Full DB id (not zero-padded to 2 digits) for every visible vehicle.
+            String label = String.format("DB-%d  %s  %.0f%%",
+                    vehicle.id, motor ? "MOTOR" : "MOBIL", vehicle.score * 100f);
+
             float padding = 12f;
             float width = textPaint.measureText(label) + padding * 2;
             float top = Math.max(0f, rect.top - 42f);
