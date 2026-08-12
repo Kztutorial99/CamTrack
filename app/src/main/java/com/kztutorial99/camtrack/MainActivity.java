@@ -222,10 +222,10 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void setupDetector() {
-        // Lite2 (448x448) sees smaller/further vehicles than Lite0 (320x320).
-        // Fall back to Lite0 if the bigger model is unavailable on this device.
-        detector = createDetector("efficientdet_lite2.tflite", 448);
-        if (detector == null) detector = createDetector("efficientdet_lite0.tflite", 320);
+        // Lite0 (320x320) first: Lite2 on CPU costs 600-1200 ms/frame on phones,
+        // which is what made the counter show 1000+ ms and the boxes lag behind.
+        detector = createDetector("efficientdet_lite0.tflite", 320);
+        if (detector == null) detector = createDetector("efficientdet_lite2.tflite", 448);
         if (detector == null) {
             statusText.setText("AI gagal dimuat • kamera tetap tersedia");
         } else {
@@ -247,10 +247,12 @@ public class MainActivity extends AppCompatActivity {
             ObjectDetector.ObjectDetectorOptions options = ObjectDetector.ObjectDetectorOptions.builder()
                     .setBaseOptions(baseOptions)
                     .setRunningMode(RunningMode.LIVE_STREAM)
-                    .setMaxResults(12)
-                    .setScoreThreshold(0.32f)
+                    .setMaxResults(25)
+                    // lower threshold: vehicles inside the box were being dropped
+                    .setScoreThreshold(0.22f)
                     // bicycle removed: it was being reported as a motorcycle and wrecked accuracy
                     .setCategoryAllowlist(Arrays.asList("car", "motorcycle", "bus", "truck"))
+
                     .setResultListener((ObjectDetectorResult result, MPImage input) -> onDetection(result))
                     .setErrorListener(error -> {
                         Log.e(TAG, "Detector error", error);
@@ -271,10 +273,13 @@ public class MainActivity extends AppCompatActivity {
         provider.unbindAll();
         Preview preview = new Preview.Builder().build();
         preview.setSurfaceProvider(previewView.getSurfaceProvider());
+        // 640x480 analysis: less pixels to copy/crop per frame -> lower ms/frame.
+        // The preview stays at full camera resolution, only the AI input shrinks.
         ResolutionSelector resolution = new ResolutionSelector.Builder()
                 .setResolutionStrategy(new ResolutionStrategy(
-                        new Size(960, 540), ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER))
+                        new Size(640, 480), ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER))
                 .build();
+
         ImageAnalysis analysis = new ImageAnalysis.Builder()
                 .setResolutionSelector(resolution)
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
