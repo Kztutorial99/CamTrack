@@ -9,19 +9,26 @@ import java.util.List;
  *
  * Design goals:
  *  - NO ghost boxes: only tracks matched on the current frame are published
- *  - stable DB ids: an id is assigned once, at confirmation, and never recycled
- *    while the vehicle is still in view
+ *  - ACCURATE DB ids: an id is handed out only after a track has been seen on
+ *    several consecutive frames, is locked to the vehicle class, and survives
+ *    short detector dropouts instead of being recycled into a new id
  *  - fast objects still match, because association uses the predicted position
  */
 final class VehicleTracker {
 
-    /** frames a track must be seen before it earns a DB id (1 = instant response) */
-    private static final int CONFIRM_HITS = 1;
-    /** frames a confirmed track is kept alive internally (id memory only, not drawn) */
-    private static final int MAX_MISSES = 1;
+    /** frames a track must be seen before it earns a DB id (kills flicker ids) */
+    private static final int CONFIRM_HITS = 3;
+    /** frames a confirmed track keeps its id alive while the detector misses it */
+    private static final int MAX_MISSES = 12;
+    /** frames a not-yet-confirmed candidate may miss before it is discarded */
+    private static final int MAX_PENDING_MISSES = 2;
     /** box smoothing: high = snappy/responsive (little lag behind the vehicle) */
-    private static final float SMOOTHING = 0.92f;
-    private static final float MIN_IOU = 0.12f;
+    private static final float SMOOTHING = 0.75f;
+    private static final float MIN_IOU = 0.2f;
+    /** a new id is only created for a reasonably confident detection */
+    private static final float NEW_TRACK_SCORE = 0.35f;
+    /** a fresh candidate overlapping this much with an existing track is a duplicate */
+    private static final float DUPLICATE_IOU = 0.55f;
 
     static final class TrackedVehicle {
         final int id;
@@ -54,6 +61,8 @@ final class VehicleTracker {
         int misses;
         int carVotes;
         int motorVotes;
+        /** class is frozen once the id is published so the label cannot flip */
+        boolean classLocked;
     }
 
     private final List<Track> tracks = new ArrayList<>();
@@ -92,10 +101,27 @@ final class VehicleTracker {
             apply(tracks.get(bestT), detections.get(bestD));
         }
 
-        // Unmatched detections become new tracks (id handed out at confirmation).
+        // Age unmatched tracks BEFORE spawning new ones, so a coasting track can
+        // still absorb the next frame instead of losing its id to a fresh track.
+        for (int t = n - 1; t >= 0; t--) {
+            if (!trackUsed[t]) {
+                Track tr = tracks.get(t);
+                tr.misses++;
+                // coast the box along its last velocity so the id survives a short miss
+                tr.box.offset(tr.vx, tr.vy);
+                boolean confirmed = tr.id > 0 && tr.hits >= CONFIRM_HITS;
+                int allowed = confirmed ? MAX_MISSES : MAX_PENDING_MISSES;
+                if (tr.misses > allowed) tracks.remove(t);
+            }
+        }
+
+        // Unmatched detections become candidates. An id is handed out only after
+        // CONFIRM_HITS frames, and duplicates of an existing track are ignored.
         for (int d = 0; d < detections.size(); d++) {
             if (detUsed[d]) continue;
             DetectionInput det = detections.get(d);
+            if (det.score < NEW_TRACK_SCORE) continue;
+            if (overlapsExisting(det)) continue;
             Track tr = new Track();
             tr.id = 0;
             tr.label = det.label;
@@ -103,30 +129,24 @@ final class VehicleTracker {
             tr.score = det.score;
             tr.hits = 1;
             vote(tr, det.label);
-            if (tr.hits >= CONFIRM_HITS) tr.id = nextId++;
             tracks.add(tr);
-        }
-
-        // Age unmatched tracks.
-        for (int t = n - 1; t >= 0; t--) {
-            if (!trackUsed[t]) {
-                Track tr = tracks.get(t);
-                tr.misses++;
-                // coast the box along its last velocity so the id survives a short miss
-                tr.box.offset(tr.vx, tr.vy);
-                if (tr.misses > MAX_MISSES || tr.hits < CONFIRM_HITS) tracks.remove(t);
-            }
         }
 
         // Publish ONLY vehicles seen on this very frame: no leftover boxes.
         List<TrackedVehicle> result = new ArrayList<>(tracks.size());
         for (Track tr : tracks) {
             if (tr.misses != 0 || tr.hits < CONFIRM_HITS || tr.id <= 0) continue;
-            String label = tr.motorVotes > tr.carVotes ? "motorcycle" : "car";
-            result.add(new TrackedVehicle(tr.id, label, tr.score, tr.box,
+            result.add(new TrackedVehicle(tr.id, tr.label, tr.score, tr.box,
                     sourceWidth, sourceHeight, true));
         }
         return result;
+    }
+
+    private boolean overlapsExisting(DetectionInput det) {
+        for (Track tr : tracks) {
+            if (iou(tr.box, det.box) >= DUPLICATE_IOU) return true;
+        }
+        return false;
     }
 
     private void apply(Track tr, DetectionInput det) {
@@ -143,13 +163,19 @@ final class VehicleTracker {
         tr.score = tr.score * (1f - SMOOTHING) + det.score * SMOOTHING;
         tr.misses = 0;
         if (tr.hits < 1000) tr.hits++;
-        if (tr.id <= 0 && tr.hits >= CONFIRM_HITS) tr.id = nextId++;
         vote(tr, det.label);
+        if (tr.id <= 0 && tr.hits >= CONFIRM_HITS) {
+            tr.id = nextId++;
+            // freeze the class at the moment the DB id becomes visible
+            tr.classLocked = true;
+        }
     }
 
     private static void vote(Track tr, String label) {
         if ("motorcycle".equals(label)) tr.motorVotes++; else tr.carVotes++;
-        tr.label = tr.motorVotes > tr.carVotes ? "motorcycle" : "car";
+        if (!tr.classLocked) {
+            tr.label = tr.motorVotes > tr.carVotes ? "motorcycle" : "car";
+        }
     }
 
     private static float mix(float previous, float current) {
@@ -157,18 +183,31 @@ final class VehicleTracker {
     }
 
     private static float association(Track tr, RectF predictedBox, DetectionInput det, int width, int height) {
+        // A locked track never accepts a detection of the other class: that swap
+        // was the reason a DB id could suddenly belong to a different vehicle.
+        if (tr.classLocked && !tr.label.equals(det.label)) return 0f;
+
         float iou = Math.max(iou(tr.box, det.box), iou(predictedBox, det.box));
         boolean sameClass = tr.label.equals(det.label);
         if (iou >= MIN_IOU) return (sameClass ? 1f : 0.6f) * (1f + iou);
 
-        // Fast motion: centroid proximity around the PREDICTED position, wide gate.
+        // Fast motion: centroid proximity around the PREDICTED position.
         float dx = predictedBox.centerX() - det.box.centerX();
         float dy = predictedBox.centerY() - det.box.centerY();
         float distance = (float) Math.sqrt(dx * dx + dy * dy);
         float span = Math.max(predictedBox.width(), predictedBox.height());
-        float gate = Math.max(120f, Math.max(span * 1.2f, Math.min(width, height) * 0.22f));
+        // tighter gate than before: a wide gate let a nearby vehicle steal the id
+        float gate = Math.max(60f, Math.min(span * 0.9f, Math.min(width, height) * 0.14f));
         if (distance >= gate) return 0f;
-        return (sameClass ? 0.9f : 0.5f) * (1f - distance / gate);
+        // size sanity: a match must be roughly the same box size
+        float sizeRatio = Math.min(area(predictedBox), area(det.box))
+                / Math.max(1f, Math.max(area(predictedBox), area(det.box)));
+        if (sizeRatio < 0.25f) return 0f;
+        return (sameClass ? 0.9f : 0.5f) * (1f - distance / gate) * sizeRatio;
+    }
+
+    private static float area(RectF r) {
+        return Math.max(0f, r.width()) * Math.max(0f, r.height());
     }
 
     private static float iou(RectF a, RectF b) {
