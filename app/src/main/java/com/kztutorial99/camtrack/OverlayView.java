@@ -42,9 +42,13 @@ public final class OverlayView extends View {
             boxPaint.setAlpha(vehicle.fresh ? 255 : 130);
             canvas.drawRect(rect, boxPaint);
 
-            // Full DB id (not zero-padded to 2 digits) for every visible vehicle.
-            String label = String.format("DB-%d  %s  %.0f%%",
-                    vehicle.id, motor ? "MOTOR" : "MOBIL", vehicle.score * 100f);
+            // The plate is shown ONLY when OCR actually read one. Vehicles with
+            // no readable plate get a plain track number (#1, #2, ...) so nothing
+            // ever looks like a plate that was never detected.
+            String kind = motor ? "MOTOR" : "MOBIL";
+            String label = vehicle.plate != null
+                    ? String.format("%s  %s", vehicle.plate, kind)
+                    : String.format("#%d  %s  %.0f%%", vehicle.id, kind, vehicle.score * 100f);
 
             float padding = 12f;
             float width = textPaint.measureText(label) + padding * 2;

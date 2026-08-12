@@ -2,7 +2,9 @@ package com.kztutorial99.camtrack;
 
 import android.graphics.RectF;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * Lightweight IoU + centroid tracker with constant-velocity prediction.
@@ -38,9 +40,11 @@ final class VehicleTracker {
         final int sourceWidth;
         final int sourceHeight;
         final boolean fresh;
+        /** real plate text read by OCR, or null when no plate was readable */
+        final String plate;
 
         TrackedVehicle(int id, String label, float score, RectF box,
-                       int sourceWidth, int sourceHeight, boolean fresh) {
+                       int sourceWidth, int sourceHeight, boolean fresh, String plate) {
             this.id = id;
             this.label = label;
             this.score = score;
@@ -48,6 +52,7 @@ final class VehicleTracker {
             this.sourceWidth = sourceWidth;
             this.sourceHeight = sourceHeight;
             this.fresh = fresh;
+            this.plate = plate;
         }
     }
 
@@ -66,7 +71,14 @@ final class VehicleTracker {
     }
 
     private final List<Track> tracks = new ArrayList<>();
+    /** plate text per track id, filled in by the OCR reader (never invented) */
+    private final Map<Integer, String> plates = new HashMap<>();
     private int nextId = 1;
+
+    /** Attach an OCR-confirmed plate to a track id. */
+    synchronized void setPlate(int trackId, String plate) {
+        if (trackId > 0 && plate != null) plates.put(trackId, plate);
+    }
 
     synchronized List<TrackedVehicle> update(List<DetectionInput> detections, int sourceWidth, int sourceHeight) {
         final int n = tracks.size();
@@ -111,7 +123,10 @@ final class VehicleTracker {
                 tr.box.offset(tr.vx, tr.vy);
                 boolean confirmed = tr.id > 0 && tr.hits >= CONFIRM_HITS;
                 int allowed = confirmed ? MAX_MISSES : MAX_PENDING_MISSES;
-                if (tr.misses > allowed) tracks.remove(t);
+                if (tr.misses > allowed) {
+                    plates.remove(tr.id);
+                    tracks.remove(t);
+                }
             }
         }
 
@@ -137,7 +152,7 @@ final class VehicleTracker {
         for (Track tr : tracks) {
             if (tr.misses != 0 || tr.hits < CONFIRM_HITS || tr.id <= 0) continue;
             result.add(new TrackedVehicle(tr.id, tr.label, tr.score, tr.box,
-                    sourceWidth, sourceHeight, true));
+                    sourceWidth, sourceHeight, true, plates.get(tr.id)));
         }
         return result;
     }
@@ -223,6 +238,7 @@ final class VehicleTracker {
 
     synchronized void clear() {
         tracks.clear();
+        plates.clear();
         nextId = 1;
     }
 

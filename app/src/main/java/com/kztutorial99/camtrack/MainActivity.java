@@ -81,6 +81,8 @@ public class MainActivity extends AppCompatActivity {
     private int targetFps = 30;
 
     private final VehicleTracker tracker = new VehicleTracker();
+    /** Reads the actual plate text; nothing is labelled as a plate without it. */
+    private PlateReader plateReader;
     private final ExecutorService cameraExecutor = Executors.newSingleThreadExecutor();
     private final AtomicLong frameStamp = new AtomicLong(0L);
     /** Drops frames while inference is still running: always work on the freshest frame. */
@@ -101,6 +103,13 @@ public class MainActivity extends AppCompatActivity {
     // Reused buffers so we stop allocating a full-frame bitmap 30x per second.
     private Bitmap rawBuffer;
 
+    /** Latest upright, full-resolution ROI crop kept for plate OCR. */
+    private volatile Bitmap ocrFrame;
+    private volatile float ocrLeft = 0f;
+    private volatile float ocrTop = 0f;
+    private volatile long lastOcrMs = 0L;
+    private static final long OCR_INTERVAL_MS = 350L;
+
     @Override protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         try {
@@ -118,6 +127,7 @@ public class MainActivity extends AppCompatActivity {
             setContentView(fallback);
             return;
         }
+        plateReader = new PlateReader((trackId, plate) -> tracker.setPlate(trackId, plate));
         try {
             if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
                 startCamera();
@@ -268,6 +278,7 @@ public class MainActivity extends AppCompatActivity {
         targetFps = fps;
         updateQualityLabel();
         tracker.clear();
+        if (plateReader != null) plateReader.clear();
         if (cameraProvider != null) {
             try {
                 bindCamera(cameraProvider);
@@ -395,11 +406,12 @@ public class MainActivity extends AppCompatActivity {
         }
         Preview preview = previewBuilder.build();
         preview.setSurfaceProvider(previewView.getSurfaceProvider());
-        // 640x480 analysis: less pixels to copy/crop per frame -> lower ms/frame.
-        // The preview stays at full camera resolution, only the AI input shrinks.
+        // 720p analysis: a 640x480 stream had far too few pixels on a plate for OCR
+        // to ever read it. Detection still runs on a 320px downscale of this frame,
+        // so ms/frame stays in the same class; only the OCR crop uses the detail.
         ResolutionSelector resolution = new ResolutionSelector.Builder()
                 .setResolutionStrategy(new ResolutionStrategy(
-                        new Size(640, 480), ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER))
+                        new Size(1280, 720), ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER))
                 .build();
 
         ImageAnalysis analysis = new ImageAnalysis.Builder()
@@ -467,6 +479,20 @@ public class MainActivity extends AppCompatActivity {
                     Matrix matrix = new Matrix();
                     matrix.postRotate(rotation);
                     crop = Bitmap.createBitmap(crop, 0, 0, crop.getWidth(), crop.getHeight(), matrix, false);
+                }
+
+                // Keep a full-resolution copy of this ROI crop for plate OCR.
+                long now = SystemClock.uptimeMillis();
+                if (plateReader != null && plateReader.available() && !plateReader.busy()
+                        && now - lastOcrMs >= OCR_INTERVAL_MS) {
+                    try {
+                        ocrFrame = crop.copy(Bitmap.Config.ARGB_8888, false);
+                        ocrLeft = left;
+                        ocrTop = top;
+                        lastOcrMs = now;
+                    } catch (Throwable t) {
+                        ocrFrame = null;
+                    }
                 }
 
                 // Downscale (never upscale) to the detector's native input size.
@@ -569,6 +595,7 @@ public class MainActivity extends AppCompatActivity {
 
             detectedInLastFrame = inputs.size();
             List<VehicleTracker.TrackedVehicle> vehicles = tracker.update(inputs, w, h);
+            readPlates(vehicles);
             final long latency = lastLatencyMs;
             runOnUiThread(() -> {
                 if (destroyed || overlayView == null || countText == null || statusText == null) return;
@@ -583,6 +610,50 @@ public class MainActivity extends AppCompatActivity {
             });
         } catch (Throwable t) {
             Log.w(TAG, "Detection result failed", t);
+        }
+    }
+
+    /**
+     * Runs OCR on the lower part of one vehicle box per pass (that is where the
+     * plate sits). Vehicles that already have a confirmed plate are skipped, and
+     * vehicles whose plate stays unreadable simply keep no plate at all.
+     */
+    private void readPlates(List<VehicleTracker.TrackedVehicle> vehicles) {
+        PlateReader reader = plateReader;
+        Bitmap base = ocrFrame;
+        if (reader == null || !reader.available() || reader.busy() || base == null) return;
+        VehicleTracker.TrackedVehicle target = null;
+        float bestArea = 0f;
+        for (VehicleTracker.TrackedVehicle v : vehicles) {
+            if (v.plate != null) continue;
+            float area = v.box.width() * v.box.height();
+            if (area > bestArea) { bestArea = area; target = v; }
+        }
+        if (target == null) return;
+        try {
+            // vehicle box -> coordinates inside the stored ROI crop
+            float bx = target.box.left - ocrLeft;
+            float by = target.box.top - ocrTop;
+            float bw = target.box.width();
+            float bh = target.box.height();
+            // plate band: bottom 55% of the vehicle, slightly widened
+            float padX = bw * 0.06f;
+            int cl = clamp(Math.round(bx - padX), 0, base.getWidth() - 2);
+            int ct = clamp(Math.round(by + bh * 0.45f), 0, base.getHeight() - 2);
+            int cr = clamp(Math.round(bx + bw + padX), cl + 2, base.getWidth());
+            int cb = clamp(Math.round(by + bh * 1.02f), ct + 2, base.getHeight());
+            if (cr - cl < 40 || cb - ct < 16) return;
+            Bitmap plateCrop = Bitmap.createBitmap(base, cl, ct, cr - cl, cb - ct);
+            // upscale small crops: OCR needs roughly 20px of text height
+            if (plateCrop.getHeight() < 120) {
+                float factor = Math.min(4f, 120f / Math.max(1, plateCrop.getHeight()));
+                plateCrop = Bitmap.createScaledBitmap(plateCrop,
+                        Math.round(plateCrop.getWidth() * factor),
+                        Math.round(plateCrop.getHeight() * factor), true);
+            }
+            reader.submit(target.id, plateCrop);
+        } catch (Throwable t) {
+            Log.w(TAG, "Plate crop failed", t);
         }
     }
 
@@ -611,6 +682,11 @@ public class MainActivity extends AppCompatActivity {
             detector = null;
         }
         tracker.clear();
+        if (plateReader != null) {
+            plateReader.close();
+            plateReader = null;
+        }
+        ocrFrame = null;
         rawBuffer = null;
         camera = null;
         cameraExecutor.shutdownNow();
