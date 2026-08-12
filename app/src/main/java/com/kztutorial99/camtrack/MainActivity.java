@@ -19,10 +19,12 @@ import android.widget.SeekBar;
 import android.widget.TextView;
 import androidx.annotation.NonNull;
 import androidx.appcompat.app.AppCompatActivity;
+import androidx.camera.core.Camera;
 import androidx.camera.core.CameraSelector;
 import androidx.camera.core.ImageAnalysis;
 import androidx.camera.core.ImageProxy;
 import androidx.camera.core.Preview;
+import androidx.camera.core.ZoomState;
 import androidx.camera.core.resolutionselector.ResolutionSelector;
 import androidx.camera.core.resolutionselector.ResolutionStrategy;
 import androidx.camera.lifecycle.ProcessCameraProvider;
@@ -64,6 +66,9 @@ public class MainActivity extends AppCompatActivity {
     private TextView countText;
     private TextView statusText;
     private ObjectDetector detector;
+    private Camera camera;
+    private SeekBar zoomBar;
+    private TextView zoomLabel;
 
     private final VehicleTracker tracker = new VehicleTracker();
     private final ExecutorService cameraExecutor = Executors.newSingleThreadExecutor();
@@ -179,6 +184,25 @@ public class MainActivity extends AppCompatActivity {
         });
         bar.addView(sizeBar);
 
+        zoomLabel = new TextView(this);
+        zoomLabel.setText("ZOOM KAMERA  1.0x");
+        zoomLabel.setTextColor(0xFF00E676);
+        zoomLabel.setTextSize(12f);
+        zoomLabel.setPadding(0, 6, 0, 0);
+        bar.addView(zoomLabel);
+
+        zoomBar = new SeekBar(this);
+        zoomBar.setMax(100);
+        zoomBar.setProgress(0);
+        zoomBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
+                if (fromUser) applyZoom(progress / 100f);
+            }
+            @Override public void onStartTrackingTouch(SeekBar seekBar) { }
+            @Override public void onStopTrackingTouch(SeekBar seekBar) { }
+        });
+        bar.addView(zoomBar);
+
         LinearLayout buttons = new LinearLayout(this);
         buttons.setOrientation(LinearLayout.HORIZONTAL);
         Button full = new Button(this);
@@ -198,6 +222,23 @@ public class MainActivity extends AppCompatActivity {
         buttons.addView(reset, lp);
         bar.addView(buttons);
         return bar;
+    }
+
+    /** Optical/digital zoom via CameraX linear zoom (0f = wide, 1f = max tele). */
+    private void applyZoom(float linear) {
+        try {
+            Camera cam = camera;
+            if (cam == null) return;
+            float value = Math.max(0f, Math.min(1f, linear));
+            cam.getCameraControl().setLinearZoom(value);
+            ZoomState state = cam.getCameraInfo().getZoomState().getValue();
+            if (zoomLabel != null) {
+                float ratio = state != null ? state.getZoomRatio() : 1f;
+                zoomLabel.setText(String.format("ZOOM KAMERA  %.1fx", ratio));
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "Zoom failed", t);
+        }
     }
 
     private void startCamera() {
@@ -222,9 +263,11 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void setupDetector() {
-        // Lite0 (320x320) first: Lite2 on CPU costs 600-1200 ms/frame on phones,
-        // which is what made the counter show 1000+ ms and the boxes lag behind.
-        detector = createDetector("efficientdet_lite0.tflite", 320);
+        // YOLO-n first (fast + sharper on small/far vehicles). If the asset is
+        // missing or the runtime rejects it, fall back to EfficientDet-Lite0 so the
+        // app never loses detection entirely.
+        detector = createDetector("yolo_n.tflite", 320);
+        if (detector == null) detector = createDetector("efficientdet_lite0.tflite", 320);
         if (detector == null) detector = createDetector("efficientdet_lite2.tflite", 448);
         if (detector == null) {
             statusText.setText("AI gagal dimuat • kamera tetap tersedia");
@@ -287,7 +330,8 @@ public class MainActivity extends AppCompatActivity {
                 .build();
         analysis.setAnalyzer(cameraExecutor, this::analyzeFrame);
         try {
-            provider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, preview, analysis);
+            camera = provider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, preview, analysis);
+            if (zoomBar != null) applyZoom(zoomBar.getProgress() / 100f);
         } catch (Throwable t) {
             Log.e(TAG, "bindToLifecycle failed", t);
             statusText.setText("Kamera gagal dibuka");
@@ -489,6 +533,7 @@ public class MainActivity extends AppCompatActivity {
         }
         tracker.clear();
         rawBuffer = null;
+        camera = null;
         cameraExecutor.shutdownNow();
         super.onDestroy();
     }
