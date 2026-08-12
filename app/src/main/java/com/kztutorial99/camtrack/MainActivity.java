@@ -109,7 +109,7 @@ public class MainActivity extends AppCompatActivity {
     private volatile float ocrTop = 0f;
     private volatile long lastOcrMs = 0L;
     private int ocrCursor = 0;
-    private static final long OCR_INTERVAL_MS = 300L;
+    private static final long OCR_INTERVAL_MS = 200L;
 
     @Override protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -615,9 +615,10 @@ public class MainActivity extends AppCompatActivity {
     }
 
     /**
-     * Runs OCR on the lower part of one vehicle box per pass (that is where the
-     * plate sits). Vehicles that already have a confirmed plate are skipped, and
-     * vehicles whose plate stays unreadable simply keep no plate at all.
+     * Runs OCR on several candidate bands of one vehicle box per pass. The plate
+     * can sit low (front bumper), mid (rear tailgate) or right under the cabin,
+     * so instead of guessing one band we hand the reader a few and let the first
+     * readable one win. Vehicles with a confirmed plate are skipped.
      */
     private void readPlates(List<VehicleTracker.TrackedVehicle> vehicles) {
         PlateReader reader = plateReader;
@@ -639,26 +640,33 @@ public class MainActivity extends AppCompatActivity {
             float by = target.box.top - ocrTop;
             float bw = target.box.width();
             float bh = target.box.height();
-            // Rear plates can sit near the vertical centre (as in DB 8246 in
-            // the reported frame). The old 45% start cut through its characters.
-            float padX = bw * 0.10f;
-            int cl = clamp(Math.round(bx - padX), 0, base.getWidth() - 2);
-            int ct = clamp(Math.round(by + bh * 0.24f), 0, base.getHeight() - 2);
-            int cr = clamp(Math.round(bx + bw + padX), cl + 2, base.getWidth());
-            int cb = clamp(Math.round(by + bh * 0.92f), ct + 2, base.getHeight());
-            if (cr - cl < 40 || cb - ct < 16) return;
-            Bitmap plateCrop = Bitmap.createBitmap(base, cl, ct, cr - cl, cb - ct);
-            // Upscale small crops: distant plates need enough character pixels.
-            if (plateCrop.getHeight() < 180) {
-                float factor = Math.min(4f, 180f / Math.max(1, plateCrop.getHeight()));
-                plateCrop = Bitmap.createScaledBitmap(plateCrop,
-                        Math.round(plateCrop.getWidth() * factor),
-                        Math.round(plateCrop.getHeight() * factor), true);
+            float[][] bands = new float[][]{
+                    {0.45f, 1.00f},   // front/rear bumper plate
+                    {0.20f, 0.70f},   // tailgate plate (pickup, box truck)
+                    {0.00f, 1.00f}    // whole vehicle as a fallback
+            };
+            List<Bitmap> crops = new ArrayList<>();
+            for (float[] band : bands) {
+                Bitmap piece = cropBand(base, bx, by, bw, bh, band[0], band[1]);
+                if (piece != null) crops.add(piece);
             }
-            reader.submit(target.id, plateCrop);
+            if (!crops.isEmpty()) reader.submit(target.id, crops);
         } catch (Throwable t) {
             Log.w(TAG, "Plate crop failed", t);
         }
+    }
+
+    /** One horizontal slice of a vehicle box, enhanced and upscaled for OCR. */
+    private Bitmap cropBand(Bitmap base, float bx, float by, float bw, float bh,
+                            float fromRatio, float toRatio) {
+        float padX = bw * 0.12f;
+        int cl = clamp(Math.round(bx - padX), 0, base.getWidth() - 2);
+        int ct = clamp(Math.round(by + bh * fromRatio), 0, base.getHeight() - 2);
+        int cr = clamp(Math.round(bx + bw + padX), cl + 2, base.getWidth());
+        int cb = clamp(Math.round(by + bh * toRatio), ct + 2, base.getHeight());
+        if (cr - cl < 40 || cb - ct < 14) return null;
+        Bitmap piece = Bitmap.createBitmap(base, cl, ct, cr - cl, cb - ct);
+        return PlateReader.enhance(piece);
     }
 
     /** Map COCO labels onto the two categories the app counts. */
