@@ -26,7 +26,6 @@ import com.google.mediapipe.framework.image.MediaImageBuilder;
 import com.google.mediapipe.tasks.core.BaseOptions;
 import com.google.mediapipe.tasks.vision.core.RunningMode;
 import com.google.mediapipe.tasks.vision.objectdetector.ObjectDetector;
-import com.google.mediapipe.tasks.vision.objectdetector.ObjectDetectorOptions;
 import com.google.mediapipe.tasks.vision.objectdetector.ObjectDetectorResult;
 import com.google.mediapipe.tasks.components.containers.Category;
 import com.google.mediapipe.tasks.components.containers.Detection;
@@ -100,7 +99,7 @@ public class MainActivity extends AppCompatActivity {
     private void setupDetector() {
         try {
             BaseOptions baseOptions = BaseOptions.builder().setModelAssetPath("efficientdet_lite0.tflite").build();
-            ObjectDetectorOptions options = ObjectDetectorOptions.builder()
+            ObjectDetector.ObjectDetectorOptions options = ObjectDetector.ObjectDetectorOptions.builder()
                     .setBaseOptions(baseOptions)
                     .setRunningMode(RunningMode.LIVE_STREAM)
                     .setMaxResults(20)
