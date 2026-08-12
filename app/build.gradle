@@ -38,9 +38,9 @@ tasks.register('downloadVehicleModel') {
     outputs.file(modelFile)
     doLast {
         assetsDir.mkdirs()
-        if (!modelFile.exists() || modelFile.length() < 1000000) {
+        if (!modelFile.exists() || modelFile.length() < 4000000) {
             println('Downloading EfficientDet-Lite0 vehicle detector...')
-            new URL('https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/int8/1/efficientdet_lite0.tflite').withInputStream { input ->
+            new URL('https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float32/1/efficientdet_lite0.tflite').withInputStream { input ->
                 modelFile.withOutputStream { output -> output << input }
             }
         }
