@@ -1,11 +1,17 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <style name="AppTheme" parent="android:style/Theme.Material.NoActionBar">
-        <item name="android:fontFamily">sans</item>
-        <item name="android:windowActionModeOverlay">true</item>
-        <item name="android:colorAccent">#00E676</item>
+    <!--
+      MUST descend from Theme.AppCompat: MainActivity extends AppCompatActivity
+      and an android:Theme.Material parent makes it crash instantly on launch
+      with "You need to use a Theme.AppCompat theme (or descendant)".
+    -->
+    <style name="AppTheme" parent="Theme.AppCompat.NoActionBar">
+        <item name="colorPrimary">#050807</item>
+        <item name="colorPrimaryDark">#000000</item>
+        <item name="colorAccent">#00E676</item>
+        <item name="android:windowBackground">#050807</item>
         <item name="android:navigationBarColor">#000000</item>
         <item name="android:statusBarColor">#000000</item>
-        <item name="android:windowLightStatusBar">false</item>
+        <item name="windowActionModeOverlay">true</item>
     </style>
 </resources>
