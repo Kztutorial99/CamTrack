@@ -50,15 +50,33 @@ public class MainActivity extends AppCompatActivity {
 
     @Override protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        getWindow().setStatusBarColor(Color.BLACK);
-        getWindow().setNavigationBarColor(Color.BLACK);
-        buildUi();
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
-            startCamera();
-        } else {
-            ActivityCompat.requestPermissions(this, new String[]{Manifest.permission.CAMERA}, CAMERA_REQUEST);
+        try {
+            getWindow().setStatusBarColor(Color.BLACK);
+            getWindow().setNavigationBarColor(Color.BLACK);
+        } catch (Throwable ignored) { }
+        try {
+            buildUi();
+        } catch (Throwable t) {
+            Log.e(TAG, "UI build failed", t);
+            TextView fallback = new TextView(this);
+            fallback.setText("CamTrack gagal memuat tampilan");
+            fallback.setTextColor(Color.WHITE);
+            fallback.setPadding(32, 96, 32, 32);
+            setContentView(fallback);
+            return;
+        }
+        try {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+                startCamera();
+            } else {
+                ActivityCompat.requestPermissions(this, new String[]{Manifest.permission.CAMERA}, CAMERA_REQUEST);
+            }
+        } catch (Throwable t) {
+            Log.e(TAG, "Startup failed", t);
+            if (statusText != null) statusText.setText("Kamera tidak dapat dimulai di perangkat ini");
         }
     }
+
 
     private void buildUi() {
         FrameLayout root = new FrameLayout(this);
