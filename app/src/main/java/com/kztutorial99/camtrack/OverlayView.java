@@ -29,7 +29,7 @@ public final class OverlayView extends View {
     }
 
     public void setVehicles(List<VehicleTracker.TrackedVehicle> value) {
-        vehicles = new ArrayList<>(value);
+        vehicles = value;
         postInvalidateOnAnimation();
     }
 
@@ -37,15 +37,20 @@ public final class OverlayView extends View {
         super.onDraw(canvas);
         for (VehicleTracker.TrackedVehicle vehicle : vehicles) {
             RectF rect = toViewRect(vehicle.box, vehicle.sourceWidth, vehicle.sourceHeight);
-            boxPaint.setColor(vehicle.label.equals("motorcycle") ? 0xFF00E5FF : 0xFF00E676);
+            boolean motor = "motorcycle".equals(vehicle.label);
+            boxPaint.setColor(motor ? 0xFF00E5FF : 0xFF00E676);
+            boxPaint.setAlpha(vehicle.fresh ? 255 : 130);
             canvas.drawRect(rect, boxPaint);
 
-            String name = vehicle.label.equals("motorcycle") ? "MOTOR" : "MOBIL";
-            String label = String.format("DB-%02d  %s  %.0f%%", vehicle.id, name, vehicle.score * 100f);
+            // Only a confirmed, currently visible vehicle gets a DB id printed.
+            String label = vehicle.fresh
+                    ? String.format("DB-%02d  %s  %.0f%%", vehicle.id, motor ? "MOTOR" : "MOBIL", vehicle.score * 100f)
+                    : (motor ? "MOTOR" : "MOBIL");
             float padding = 12f;
             float width = textPaint.measureText(label) + padding * 2;
             float top = Math.max(0f, rect.top - 42f);
             labelPaint.setColor(boxPaint.getColor());
+            labelPaint.setAlpha(vehicle.fresh ? 255 : 130);
             canvas.drawRect(rect.left, top, rect.left + width, rect.top, labelPaint);
             textPaint.setColor(0xFF00120A);
             canvas.drawText(label, rect.left + padding, rect.top - 12f, textPaint);
