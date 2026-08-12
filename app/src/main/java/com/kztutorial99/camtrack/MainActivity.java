@@ -9,6 +9,7 @@ import android.graphics.RectF;
 import android.os.Bundle;
 import android.os.SystemClock;
 import android.util.Log;
+import android.util.Range;
 import android.util.Size;
 import android.view.Gravity;
 import android.view.View;
@@ -18,6 +19,9 @@ import android.widget.LinearLayout;
 import android.widget.SeekBar;
 import android.widget.TextView;
 import androidx.annotation.NonNull;
+import androidx.annotation.OptIn;
+import androidx.camera.camera2.interop.Camera2Interop;
+import androidx.camera.camera2.interop.ExperimentalCamera2Interop;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.camera.core.Camera;
 import androidx.camera.core.CameraSelector;
@@ -69,6 +73,12 @@ public class MainActivity extends AppCompatActivity {
     private Camera camera;
     private SeekBar zoomBar;
     private TextView zoomLabel;
+    private TextView qualityLabel;
+    private ProcessCameraProvider cameraProvider;
+
+    /** Camera capture/preview quality mode chosen by the user. */
+    private Size captureSize = new Size(1280, 720);
+    private int targetFps = 30;
 
     private final VehicleTracker tracker = new VehicleTracker();
     private final ExecutorService cameraExecutor = Executors.newSingleThreadExecutor();
@@ -203,6 +213,34 @@ public class MainActivity extends AppCompatActivity {
         });
         bar.addView(zoomBar);
 
+        qualityLabel = new TextView(this);
+        qualityLabel.setTextColor(0xFF00E676);
+        qualityLabel.setTextSize(12f);
+        qualityLabel.setPadding(0, 10, 0, 4);
+        bar.addView(qualityLabel);
+
+        LinearLayout quality = new LinearLayout(this);
+        quality.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout.LayoutParams qlp = new LinearLayout.LayoutParams(0, -2, 1f);
+        Button hd = new Button(this);
+        hd.setText("720P");
+        hd.setOnClickListener(v -> setQuality(new Size(1280, 720), targetFps));
+        Button fhd = new Button(this);
+        fhd.setText("1080P");
+        fhd.setOnClickListener(v -> setQuality(new Size(1920, 1080), targetFps));
+        Button fps30 = new Button(this);
+        fps30.setText("30FPS");
+        fps30.setOnClickListener(v -> setQuality(captureSize, 30));
+        Button fps60 = new Button(this);
+        fps60.setText("60FPS");
+        fps60.setOnClickListener(v -> setQuality(captureSize, 60));
+        quality.addView(hd, qlp);
+        quality.addView(fhd, qlp);
+        quality.addView(fps30, qlp);
+        quality.addView(fps60, qlp);
+        bar.addView(quality);
+        updateQualityLabel();
+
         LinearLayout buttons = new LinearLayout(this);
         buttons.setOrientation(LinearLayout.HORIZONTAL);
         Button full = new Button(this);
@@ -222,6 +260,27 @@ public class MainActivity extends AppCompatActivity {
         buttons.addView(reset, lp);
         bar.addView(buttons);
         return bar;
+    }
+
+    /** Switch resolution / frame rate mode and rebind the camera use cases. */
+    private void setQuality(Size size, int fps) {
+        captureSize = size;
+        targetFps = fps;
+        updateQualityLabel();
+        tracker.clear();
+        if (cameraProvider != null) {
+            try {
+                bindCamera(cameraProvider);
+            } catch (Throwable t) {
+                Log.w(TAG, "Rebind after quality change failed", t);
+            }
+        }
+    }
+
+    private void updateQualityLabel() {
+        if (qualityLabel == null) return;
+        qualityLabel.setText(String.format("MODE KAMERA  %dP  •  %d FPS",
+                Math.min(captureSize.getWidth(), captureSize.getHeight()), targetFps));
     }
 
     /** Optical/digital zoom via CameraX linear zoom (0f = wide, 1f = max tele). */
@@ -311,10 +370,30 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
+    @OptIn(markerClass = ExperimentalCamera2Interop.class)
     private void bindCamera(ProcessCameraProvider provider) {
         if (destroyed) return;
+        cameraProvider = provider;
         provider.unbindAll();
-        Preview preview = new Preview.Builder().build();
+
+        // Preview/capture runs at the resolution and frame rate the user picked
+        // (720p/1080p, 30/60 FPS). The AI input stays small so detection speed
+        // does not collapse at 1080p60.
+        ResolutionSelector previewResolution = new ResolutionSelector.Builder()
+                .setResolutionStrategy(new ResolutionStrategy(
+                        captureSize, ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER))
+                .build();
+        Preview.Builder previewBuilder = new Preview.Builder()
+                .setResolutionSelector(previewResolution);
+        try {
+            new Camera2Interop.Extender<>(previewBuilder)
+                    .setCaptureRequestOption(
+                            android.hardware.camera2.CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
+                            new Range<>(targetFps, targetFps));
+        } catch (Throwable t) {
+            Log.w(TAG, "FPS range not supported: " + targetFps, t);
+        }
+        Preview preview = previewBuilder.build();
         preview.setSurfaceProvider(previewView.getSurfaceProvider());
         // 640x480 analysis: less pixels to copy/crop per frame -> lower ms/frame.
         // The preview stays at full camera resolution, only the AI input shrinks.
@@ -538,3 +617,4 @@ public class MainActivity extends AppCompatActivity {
         super.onDestroy();
     }
 }
+
