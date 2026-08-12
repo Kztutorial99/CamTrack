@@ -7,7 +7,6 @@ import android.os.Bundle;
 import android.os.SystemClock;
 import android.util.Size;
 import android.view.Gravity;
-import android.view.View;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.TextView;
@@ -39,7 +38,6 @@ import java.util.concurrent.Executors;
 
 public class MainActivity extends AppCompatActivity {
     private static final int CAMERA_REQUEST = 1001;
-
     private PreviewView previewView;
     private OverlayView overlayView;
     private TextView countText;
@@ -53,11 +51,8 @@ public class MainActivity extends AppCompatActivity {
         getWindow().setStatusBarColor(Color.BLACK);
         getWindow().setNavigationBarColor(Color.BLACK);
         buildUi();
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
-            startCamera();
-        } else {
-            ActivityCompat.requestPermissions(this, new String[]{Manifest.permission.CAMERA}, CAMERA_REQUEST);
-        }
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) startCamera();
+        else ActivityCompat.requestPermissions(this, new String[]{Manifest.permission.CAMERA}, CAMERA_REQUEST);
     }
 
     private void buildUi() {
@@ -65,7 +60,6 @@ public class MainActivity extends AppCompatActivity {
         previewView = new PreviewView(this);
         previewView.setScaleType(PreviewView.ScaleType.FIT_CENTER);
         root.addView(previewView, new FrameLayout.LayoutParams(-1, -1));
-
         overlayView = new OverlayView(this);
         root.addView(overlayView, new FrameLayout.LayoutParams(-1, -1));
 
@@ -73,29 +67,24 @@ public class MainActivity extends AppCompatActivity {
         header.setOrientation(LinearLayout.VERTICAL);
         header.setPadding(24, 18, 24, 18);
         header.setBackgroundColor(0xCC050807);
-
         TextView title = new TextView(this);
         title.setText("CAMTRACK  •  AI VEHICLE TRACKING");
         title.setTextColor(Color.WHITE);
         title.setTextSize(17f);
         title.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
         header.addView(title);
-
         countText = new TextView(this);
         countText.setText("MOBIL 0   •   MOTOR 0   •   TOTAL 0");
         countText.setTextColor(0xFF00E676);
         countText.setTextSize(15f);
         countText.setPadding(0, 8, 0, 0);
         header.addView(countText);
-
         statusText = new TextView(this);
         statusText.setText("Memuat AI detector...");
         statusText.setTextColor(0xFFD0D8D4);
         statusText.setTextSize(12f);
         header.addView(statusText);
-
-        FrameLayout.LayoutParams headerParams = new FrameLayout.LayoutParams(-1, -2, Gravity.TOP);
-        root.addView(header, headerParams);
+        root.addView(header, new FrameLayout.LayoutParams(-1, -2, Gravity.TOP));
         setContentView(root);
     }
 
@@ -103,21 +92,14 @@ public class MainActivity extends AppCompatActivity {
         setupDetector();
         ListenableFuture<ProcessCameraProvider> future = ProcessCameraProvider.getInstance(this);
         future.addListener(() -> {
-            try {
-                ProcessCameraProvider provider = future.get();
-                bindCamera(provider);
-            } catch (Exception e) {
-                statusText.setText("Camera error: " + e.getMessage());
-            }
+            try { bindCamera(future.get()); }
+            catch (Exception e) { statusText.setText("Camera error: " + e.getMessage()); }
         }, ContextCompat.getMainExecutor(this));
     }
 
     private void setupDetector() {
         try {
-            BaseOptions baseOptions = BaseOptions.builder()
-                    .setModelAssetPath("efficientdet_lite0.tflite")
-                    .build();
-
+            BaseOptions baseOptions = BaseOptions.builder().setModelAssetPath("efficientdet_lite0.tflite").build();
             ObjectDetectorOptions options = ObjectDetectorOptions.builder()
                     .setBaseOptions(baseOptions)
                     .setRunningMode(RunningMode.LIVE_STREAM)
@@ -125,7 +107,6 @@ public class MainActivity extends AppCompatActivity {
                     .setScoreThreshold(0.35f)
                     .setCategoryAllowlist(Arrays.asList("car", "motorcycle"))
                     .setResultListener((ObjectDetectorResult result, MPImage input) -> onDetection(result))
-                    .setErrorListener((RuntimeException error) -> runOnUiThread(() -> statusText.setText("AI error: " + error.getMessage())))
                     .build();
             detector = ObjectDetector.createFromOptions(this, options);
             statusText.setText("AI aktif • deteksi mobil & motor");
@@ -136,11 +117,8 @@ public class MainActivity extends AppCompatActivity {
 
     private void bindCamera(ProcessCameraProvider provider) {
         provider.unbindAll();
-        CameraSelector selector = CameraSelector.DEFAULT_BACK_CAMERA;
-
         Preview preview = new Preview.Builder().build();
         preview.setSurfaceProvider(previewView.getSurfaceProvider());
-
         int rotation = previewView.getDisplay() != null ? previewView.getDisplay().getRotation() : 0;
         ImageAnalysis analysis = new ImageAnalysis.Builder()
                 .setTargetResolution(new Size(1280, 720))
@@ -148,8 +126,7 @@ public class MainActivity extends AppCompatActivity {
                 .build();
         analysis.setTargetRotation(rotation);
         analysis.setAnalyzer(cameraExecutor, this::analyzeFrame);
-
-        provider.bindToLifecycle(this, selector, preview, analysis);
+        provider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, preview, analysis);
     }
 
     private void analyzeFrame(@NonNull ImageProxy imageProxy) {
@@ -173,12 +150,10 @@ public class MainActivity extends AppCompatActivity {
             if (!"car".equals(label) && !"motorcycle".equals(label)) continue;
             inputs.add(new VehicleTracker.DetectionInput(label, category.score(), detection.boundingBox()));
         }
-
         int sourceWidth = 1280;
         int sourceHeight = 720;
         int rotation = previewView.getDisplay() != null ? rotationDegrees(previewView.getDisplay().getRotation()) : 0;
         List<VehicleTracker.TrackedVehicle> vehicles = tracker.update(inputs, sourceWidth, sourceHeight, rotation);
-
         runOnUiThread(() -> {
             overlayView.setVehicles(vehicles);
             int cars = 0, motors = 0;
@@ -198,11 +173,8 @@ public class MainActivity extends AppCompatActivity {
 
     @Override public void onRequestPermissionsResult(int requestCode, @NonNull String[] permissions, @NonNull int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
-        if (requestCode == CAMERA_REQUEST && grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-            startCamera();
-        } else if (statusText != null) {
-            statusText.setText("Izin kamera diperlukan untuk CamTrack");
-        }
+        if (requestCode == CAMERA_REQUEST && grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) startCamera();
+        else if (statusText != null) statusText.setText("Izin kamera diperlukan untuk CamTrack");
     }
 
     @Override protected void onDestroy() {
