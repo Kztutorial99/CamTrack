@@ -36,7 +36,7 @@ public final class OverlayView extends View {
     @Override protected void onDraw(Canvas canvas) {
         super.onDraw(canvas);
         for (VehicleTracker.TrackedVehicle vehicle : vehicles) {
-            RectF rect = toViewRect(vehicle.box, vehicle.sourceWidth, vehicle.sourceHeight, vehicle.rotation);
+            RectF rect = toViewRect(vehicle.box, vehicle.sourceWidth, vehicle.sourceHeight);
             boxPaint.setColor(vehicle.label.equals("motorcycle") ? 0xFF00E5FF : 0xFF00E676);
             canvas.drawRect(rect, boxPaint);
 
@@ -52,27 +52,16 @@ public final class OverlayView extends View {
         }
     }
 
-    private RectF toViewRect(RectF box, int sourceWidth, int sourceHeight, int rotation) {
-        RectF r = new RectF(box);
-        float rotatedWidth = sourceWidth;
-        float rotatedHeight = sourceHeight;
-        if (rotation == 90) {
-            r = new RectF(sourceHeight - box.bottom, box.left, sourceHeight - box.top, box.right);
-            rotatedWidth = sourceHeight; rotatedHeight = sourceWidth;
-        } else if (rotation == 180) {
-            r = new RectF(sourceWidth - box.right, sourceHeight - box.bottom, sourceWidth - box.left, sourceHeight - box.top);
-        } else if (rotation == 270) {
-            r = new RectF(box.top, sourceWidth - box.right, box.bottom, sourceWidth - box.left);
-            rotatedWidth = sourceHeight; rotatedHeight = sourceWidth;
-        }
-
-        float scale = Math.min(getWidth() / rotatedWidth, getHeight() / rotatedHeight);
-        float dx = (getWidth() - rotatedWidth * scale) / 2f;
-        float dy = (getHeight() - rotatedHeight * scale) / 2f;
-        r.left = r.left * scale + dx;
-        r.right = r.right * scale + dx;
-        r.top = r.top * scale + dy;
-        r.bottom = r.bottom * scale + dy;
-        return r;
+    /** Boxes arrive already upright, in full-frame pixel coordinates. */
+    private RectF toViewRect(RectF box, int sourceWidth, int sourceHeight) {
+        if (sourceWidth <= 0 || sourceHeight <= 0) return new RectF(box);
+        float scale = Math.min(getWidth() / (float) sourceWidth, getHeight() / (float) sourceHeight);
+        float dx = (getWidth() - sourceWidth * scale) / 2f;
+        float dy = (getHeight() - sourceHeight * scale) / 2f;
+        return new RectF(
+                box.left * scale + dx,
+                box.top * scale + dy,
+                box.right * scale + dx,
+                box.bottom * scale + dy);
     }
 }
