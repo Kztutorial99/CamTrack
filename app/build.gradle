@@ -32,10 +32,15 @@ android {
     androidResources { noCompress 'tflite' }
 }
 
+// Optional drop-in slot: if a MediaPipe-compatible (metadata-packed) YOLO-n
+// model is placed at app/src/main/assets/yolo_n.tflite it is used first.
+// Nothing is downloaded for it: no public YOLO-n build ships the TFLite
+// metadata the MediaPipe ObjectDetector requires.
 def vehicleModels = [
+    // int8 build: ~2-3x faster per frame than float32 on CPU, same recall class.
     'efficientdet_lite0.tflite': [
-        'https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float32/1/efficientdet_lite0.tflite',
-        4000000
+        'https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/int8/1/efficientdet_lite0.tflite',
+        3000000
     ],
     // Lite2 (448x448 input) detects smaller / further vehicles than Lite0.
     'efficientdet_lite2.tflite': [
@@ -47,6 +52,7 @@ def vehicleModels = [
 tasks.register('downloadVehicleModel') {
     def assetsDir = file('src/main/assets')
     outputs.files(vehicleModels.keySet().collect { file("src/main/assets/$it") })
+    outputs.upToDateWhen { false }
     doLast {
         assetsDir.mkdirs()
         vehicleModels.each { name, spec ->
