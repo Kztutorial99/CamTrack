@@ -5,23 +5,23 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * Lightweight IoU + centroid tracker.
+ * Lightweight IoU + centroid tracker with constant-velocity prediction.
  *
  * Design goals:
- *  - stable DB-xx ids (an id must survive short misses instead of being recycled)
- *  - no id is published until the track is confirmed on several frames,
- *    so a one-frame false positive never gets a DB label
- *  - smoothed boxes so the overlay looks instant instead of jittery
+ *  - NO ghost boxes: only tracks matched on the current frame are published
+ *  - stable DB ids: an id is assigned once, at confirmation, and never recycled
+ *    while the vehicle is still in view
+ *  - fast objects still match, because association uses the predicted position
  */
 final class VehicleTracker {
 
-    /** frames a track must be seen before it earns a DB id */
-    private static final int CONFIRM_HITS = 2;
-    /** frames a confirmed track survives without a matching detection */
-    private static final int MAX_MISSES = 6;
-    /** box smoothing factor: higher = snappier (more responsive), lower = smoother */
-    private static final float SMOOTHING = 0.65f;
-    private static final float MIN_IOU = 0.2f;
+    /** frames a track must be seen before it earns a DB id (1 = instant response) */
+    private static final int CONFIRM_HITS = 1;
+    /** frames a confirmed track is kept alive internally (id memory only, not drawn) */
+    private static final int MAX_MISSES = 3;
+    /** box smoothing: high = snappy/responsive (little lag behind the vehicle) */
+    private static final float SMOOTHING = 0.85f;
+    private static final float MIN_IOU = 0.12f;
 
     static final class TrackedVehicle {
         final int id;
@@ -49,6 +49,7 @@ final class VehicleTracker {
         String label;
         float score;
         final RectF box = new RectF();
+        float vx, vy;
         int hits;
         int misses;
         int carVotes;
@@ -63,6 +64,15 @@ final class VehicleTracker {
         final boolean[] trackUsed = new boolean[n];
         final boolean[] detUsed = new boolean[detections.size()];
 
+        // Predict where each track should be on this frame before matching.
+        final RectF[] predicted = new RectF[n];
+        for (int t = 0; t < n; t++) {
+            Track tr = tracks.get(t);
+            predicted[t] = new RectF(
+                    tr.box.left + tr.vx, tr.box.top + tr.vy,
+                    tr.box.right + tr.vx, tr.box.bottom + tr.vy);
+        }
+
         // Greedy best-first association on IoU, falling back to centroid distance.
         while (true) {
             float bestScore = 0f;
@@ -72,8 +82,7 @@ final class VehicleTracker {
                 DetectionInput det = detections.get(d);
                 for (int t = 0; t < n; t++) {
                     if (trackUsed[t]) continue;
-                    Track tr = tracks.get(t);
-                    float s = association(tr, det, sourceWidth, sourceHeight);
+                    float s = association(tracks.get(t), predicted[t], det, sourceWidth, sourceHeight);
                     if (s > bestScore) { bestScore = s; bestT = t; bestD = d; }
                 }
             }
@@ -83,17 +92,18 @@ final class VehicleTracker {
             apply(tracks.get(bestT), detections.get(bestD));
         }
 
-        // Unmatched detections become new (still unconfirmed) tracks.
+        // Unmatched detections become new tracks (id handed out at confirmation).
         for (int d = 0; d < detections.size(); d++) {
             if (detUsed[d]) continue;
             DetectionInput det = detections.get(d);
             Track tr = new Track();
-            tr.id = nextId++;
+            tr.id = 0;
             tr.label = det.label;
             tr.box.set(det.box);
             tr.score = det.score;
             tr.hits = 1;
             vote(tr, det.label);
+            if (tr.hits >= CONFIRM_HITS) tr.id = nextId++;
             tracks.add(tr);
         }
 
@@ -102,31 +112,38 @@ final class VehicleTracker {
             if (!trackUsed[t]) {
                 Track tr = tracks.get(t);
                 tr.misses++;
-                // unconfirmed tracks die immediately: never label a flicker
+                // coast the box along its last velocity so the id survives a short miss
+                tr.box.offset(tr.vx, tr.vy);
                 if (tr.misses > MAX_MISSES || tr.hits < CONFIRM_HITS) tracks.remove(t);
             }
         }
 
+        // Publish ONLY vehicles seen on this very frame: no leftover boxes.
         List<TrackedVehicle> result = new ArrayList<>(tracks.size());
         for (Track tr : tracks) {
-            if (tr.hits < CONFIRM_HITS) continue;
+            if (tr.misses != 0 || tr.hits < CONFIRM_HITS || tr.id <= 0) continue;
             String label = tr.motorVotes > tr.carVotes ? "motorcycle" : "car";
             result.add(new TrackedVehicle(tr.id, label, tr.score, tr.box,
-                    sourceWidth, sourceHeight, tr.misses == 0));
+                    sourceWidth, sourceHeight, true));
         }
         return result;
     }
 
     private void apply(Track tr, DetectionInput det) {
+        float prevCx = tr.box.centerX();
+        float prevCy = tr.box.centerY();
         // Exponential smoothing keeps the box glued to the vehicle without jitter.
         tr.box.set(
                 mix(tr.box.left, det.box.left),
                 mix(tr.box.top, det.box.top),
                 mix(tr.box.right, det.box.right),
                 mix(tr.box.bottom, det.box.bottom));
+        tr.vx = (tr.box.centerX() - prevCx) * 0.7f + tr.vx * 0.3f;
+        tr.vy = (tr.box.centerY() - prevCy) * 0.7f + tr.vy * 0.3f;
         tr.score = tr.score * (1f - SMOOTHING) + det.score * SMOOTHING;
         tr.misses = 0;
         if (tr.hits < 1000) tr.hits++;
+        if (tr.id <= 0 && tr.hits >= CONFIRM_HITS) tr.id = nextId++;
         vote(tr, det.label);
     }
 
@@ -139,18 +156,19 @@ final class VehicleTracker {
         return previous * (1f - SMOOTHING) + current * SMOOTHING;
     }
 
-    private static float association(Track tr, DetectionInput det, int width, int height) {
-        float iou = iou(tr.box, det.box);
+    private static float association(Track tr, RectF predictedBox, DetectionInput det, int width, int height) {
+        float iou = Math.max(iou(tr.box, det.box), iou(predictedBox, det.box));
         boolean sameClass = tr.label.equals(det.label);
-        if (iou >= MIN_IOU) return (sameClass ? 1f : 0.55f) * (1f + iou);
+        if (iou >= MIN_IOU) return (sameClass ? 1f : 0.6f) * (1f + iou);
 
-        // Fast motion: fall back to centroid proximity within a tight gate.
-        float dx = tr.box.centerX() - det.box.centerX();
-        float dy = tr.box.centerY() - det.box.centerY();
+        // Fast motion: centroid proximity around the PREDICTED position, wide gate.
+        float dx = predictedBox.centerX() - det.box.centerX();
+        float dy = predictedBox.centerY() - det.box.centerY();
         float distance = (float) Math.sqrt(dx * dx + dy * dy);
-        float gate = Math.max(60f, Math.min(width, height) * 0.10f);
-        if (distance >= gate || !sameClass) return 0f;
-        return 0.9f * (1f - distance / gate);
+        float span = Math.max(predictedBox.width(), predictedBox.height());
+        float gate = Math.max(120f, Math.max(span * 1.2f, Math.min(width, height) * 0.22f));
+        if (distance >= gate) return 0f;
+        return (sameClass ? 0.9f : 0.5f) * (1f - distance / gate);
     }
 
     private static float iou(RectF a, RectF b) {
