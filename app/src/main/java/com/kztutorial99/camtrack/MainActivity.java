@@ -56,7 +56,7 @@ public class MainActivity extends AppCompatActivity {
      * downscaled here (cheap) instead of inside the graph (expensive).
      * Upscaling adds zero information and only costs latency.
      */
-    private static final int DETECTOR_INPUT = 320;
+    private static volatile int detectorInput = 320;
 
     private PreviewView previewView;
     private OverlayView overlayView;
@@ -222,8 +222,10 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void setupDetector() {
-        detector = createDetector(Delegate.GPU);
-        if (detector == null) detector = createDetector(Delegate.CPU);
+        // Lite2 (448x448) sees smaller/further vehicles than Lite0 (320x320).
+        // Fall back to Lite0 if the bigger model is unavailable on this device.
+        detector = createDetector("efficientdet_lite2.tflite", 448);
+        if (detector == null) detector = createDetector("efficientdet_lite0.tflite", 320);
         if (detector == null) {
             statusText.setText("AI gagal dimuat • kamera tetap tersedia");
         } else {
@@ -231,11 +233,16 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    private ObjectDetector createDetector(Delegate delegate) {
+    /**
+     * CPU delegate only. The GPU delegate crashes the process (native SIGSEGV,
+     * uncatchable in Java) on many Mali/Adreno drivers the moment the first
+     * inference runs, which is why the app force-closed at detection time.
+     */
+    private ObjectDetector createDetector(String modelPath, int inputSize) {
         try {
             BaseOptions baseOptions = BaseOptions.builder()
-                    .setModelAssetPath("efficientdet_lite0.tflite")
-                    .setDelegate(delegate)
+                    .setModelAssetPath(modelPath)
+                    .setDelegate(Delegate.CPU)
                     .build();
             ObjectDetector.ObjectDetectorOptions options = ObjectDetector.ObjectDetectorOptions.builder()
                     .setBaseOptions(baseOptions)
@@ -245,11 +252,16 @@ public class MainActivity extends AppCompatActivity {
                     // bicycle removed: it was being reported as a motorcycle and wrecked accuracy
                     .setCategoryAllowlist(Arrays.asList("car", "motorcycle", "bus", "truck"))
                     .setResultListener((ObjectDetectorResult result, MPImage input) -> onDetection(result))
-                    .setErrorListener(error -> Log.e(TAG, "Detector error", error))
+                    .setErrorListener(error -> {
+                        Log.e(TAG, "Detector error", error);
+                        inFlight.set(false);
+                    })
                     .build();
-            return ObjectDetector.createFromOptions(this, options);
+            ObjectDetector created = ObjectDetector.createFromOptions(this, options);
+            if (created != null) detectorInput = inputSize;
+            return created;
         } catch (Throwable t) {
-            Log.w(TAG, "Detector init failed on " + delegate, t);
+            Log.w(TAG, "Detector init failed for " + modelPath, t);
             return null;
         }
     }
@@ -332,8 +344,8 @@ public class MainActivity extends AppCompatActivity {
                 // Downscale (never upscale) to the detector's native input size.
                 float scale = 1f;
                 int longSide = Math.max(crop.getWidth(), crop.getHeight());
-                if (longSide > DETECTOR_INPUT) {
-                    scale = DETECTOR_INPUT / (float) longSide;
+                if (longSide > detectorInput) {
+                    scale = detectorInput / (float) longSide;
                     crop = Bitmap.createScaledBitmap(crop,
                             Math.max(2, Math.round(crop.getWidth() * scale)),
                             Math.max(2, Math.round(crop.getHeight() * scale)), false);
@@ -342,6 +354,14 @@ public class MainActivity extends AppCompatActivity {
                 cropLeft = left;
                 cropTop = top;
                 cropScale = 1f / scale;
+
+                // createBitmap() returns the SOURCE itself when nothing is cropped or
+                // rotated. Handing the reused frame buffer to MediaPipe let the next
+                // frame overwrite pixels mid-inference -> native crash. Always copy.
+                if (crop == raw || crop == rawBuffer) {
+                    crop = crop.copy(Bitmap.Config.ARGB_8888, false);
+                    if (crop == null) return;
+                }
 
                 inferenceStart = SystemClock.uptimeMillis();
                 d.detectAsync(new BitmapImageBuilder(crop).build(), frameStamp.incrementAndGet());
@@ -423,7 +443,7 @@ public class MainActivity extends AppCompatActivity {
             List<VehicleTracker.TrackedVehicle> vehicles = tracker.update(inputs, w, h);
             final long latency = lastLatencyMs;
             runOnUiThread(() -> {
-                if (destroyed) return;
+                if (destroyed || overlayView == null || countText == null || statusText == null) return;
                 overlayView.setVehicles(vehicles);
                 int cars = 0, motors = 0;
                 for (VehicleTracker.TrackedVehicle v : vehicles) {
