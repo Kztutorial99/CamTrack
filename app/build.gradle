@@ -1,0 +1,60 @@
+plugins { id 'com.android.application' }
+
+android {
+    namespace 'com.kztutorial99.camtrack'
+    compileSdk 35
+
+    defaultConfig {
+        applicationId 'com.kztutorial99.camtrack'
+        minSdk 24
+        targetSdk 35
+        versionCode 1
+        versionName '1.0.0'
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+        debug { minifyEnabled false }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    packaging {
+        resources { excludes += ['/META-INF/{AL2.0,LGPL2.1}'] }
+    }
+
+    androidResources { noCompress 'tflite' }
+}
+
+tasks.register('downloadVehicleModel') {
+    def assetsDir = file('src/main/assets')
+    def modelFile = file('src/main/assets/efficientdet_lite0.tflite')
+    outputs.file(modelFile)
+    doLast {
+        assetsDir.mkdirs()
+        if (!modelFile.exists() || modelFile.length() < 1000000) {
+            println('Downloading EfficientDet-Lite0 vehicle detector...')
+            new URL('https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/int8/1/efficientdet_lite0.tflite').withInputStream { input ->
+                modelFile.withOutputStream { output -> output << input }
+            }
+        }
+    }
+}
+
+tasks.named('preBuild').configure { dependsOn tasks.named('downloadVehicleModel') }
+
+dependencies {
+    implementation 'androidx.core:core:1.15.0'
+    implementation 'androidx.appcompat:appcompat:1.7.0'
+    implementation 'androidx.camera:camera-core:1.4.2'
+    implementation 'androidx.camera:camera-camera2:1.4.2'
+    implementation 'androidx.camera:camera-lifecycle:1.4.2'
+    implementation 'androidx.camera:camera-view:1.4.2'
+    implementation 'com.google.mediapipe:tasks-vision:0.10.35'
+}
