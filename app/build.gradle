@@ -32,16 +32,30 @@ android {
     androidResources { noCompress 'tflite' }
 }
 
+def vehicleModels = [
+    'efficientdet_lite0.tflite': [
+        'https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float32/1/efficientdet_lite0.tflite',
+        4000000
+    ],
+    // Lite2 (448x448 input) detects smaller / further vehicles than Lite0.
+    'efficientdet_lite2.tflite': [
+        'https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite2/float32/1/efficientdet_lite2.tflite',
+        7000000
+    ]
+]
+
 tasks.register('downloadVehicleModel') {
     def assetsDir = file('src/main/assets')
-    def modelFile = file('src/main/assets/efficientdet_lite0.tflite')
-    outputs.file(modelFile)
+    outputs.files(vehicleModels.keySet().collect { file("src/main/assets/$it") })
     doLast {
         assetsDir.mkdirs()
-        if (!modelFile.exists() || modelFile.length() < 4000000) {
-            println('Downloading EfficientDet-Lite0 vehicle detector...')
-            new URL('https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float32/1/efficientdet_lite0.tflite').withInputStream { input ->
-                modelFile.withOutputStream { output -> output << input }
+        vehicleModels.each { name, spec ->
+            def modelFile = file("src/main/assets/$name")
+            if (!modelFile.exists() || modelFile.length() < spec[1]) {
+                println("Downloading $name vehicle detector...")
+                new URL(spec[0]).withInputStream { input ->
+                    modelFile.withOutputStream { output -> output << input }
+                }
             }
         }
     }
