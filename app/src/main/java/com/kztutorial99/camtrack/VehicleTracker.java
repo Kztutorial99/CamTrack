@@ -18,9 +18,9 @@ final class VehicleTracker {
     /** frames a track must be seen before it earns a DB id (1 = instant response) */
     private static final int CONFIRM_HITS = 1;
     /** frames a confirmed track is kept alive internally (id memory only, not drawn) */
-    private static final int MAX_MISSES = 3;
+    private static final int MAX_MISSES = 1;
     /** box smoothing: high = snappy/responsive (little lag behind the vehicle) */
-    private static final float SMOOTHING = 0.85f;
+    private static final float SMOOTHING = 0.92f;
     private static final float MIN_IOU = 0.12f;
 
     static final class TrackedVehicle {
