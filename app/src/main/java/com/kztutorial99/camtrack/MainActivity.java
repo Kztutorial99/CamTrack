@@ -108,7 +108,8 @@ public class MainActivity extends AppCompatActivity {
     private volatile float ocrLeft = 0f;
     private volatile float ocrTop = 0f;
     private volatile long lastOcrMs = 0L;
-    private static final long OCR_INTERVAL_MS = 350L;
+    private int ocrCursor = 0;
+    private static final long OCR_INTERVAL_MS = 300L;
 
     @Override protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -622,31 +623,34 @@ public class MainActivity extends AppCompatActivity {
         PlateReader reader = plateReader;
         Bitmap base = ocrFrame;
         if (reader == null || !reader.available() || reader.busy() || base == null) return;
-        VehicleTracker.TrackedVehicle target = null;
-        float bestArea = 0f;
+        // Round-robin unread vehicles. Picking only the largest vehicle forever
+        // starved every smaller vehicle whenever the largest had no visible plate.
+        List<VehicleTracker.TrackedVehicle> unread = new ArrayList<>();
         for (VehicleTracker.TrackedVehicle v : vehicles) {
-            if (v.plate != null) continue;
-            float area = v.box.width() * v.box.height();
-            if (area > bestArea) { bestArea = area; target = v; }
+            if (v.plate == null) unread.add(v);
         }
-        if (target == null) return;
+        if (unread.isEmpty()) return;
+        if (ocrCursor >= unread.size()) ocrCursor = 0;
+        VehicleTracker.TrackedVehicle target = unread.get(ocrCursor);
+        ocrCursor = (ocrCursor + 1) % unread.size();
         try {
             // vehicle box -> coordinates inside the stored ROI crop
             float bx = target.box.left - ocrLeft;
             float by = target.box.top - ocrTop;
             float bw = target.box.width();
             float bh = target.box.height();
-            // plate band: bottom 55% of the vehicle, slightly widened
-            float padX = bw * 0.06f;
+            // Rear plates can sit near the vertical centre (as in DB 8246 in
+            // the reported frame). The old 45% start cut through its characters.
+            float padX = bw * 0.10f;
             int cl = clamp(Math.round(bx - padX), 0, base.getWidth() - 2);
-            int ct = clamp(Math.round(by + bh * 0.45f), 0, base.getHeight() - 2);
+            int ct = clamp(Math.round(by + bh * 0.24f), 0, base.getHeight() - 2);
             int cr = clamp(Math.round(bx + bw + padX), cl + 2, base.getWidth());
-            int cb = clamp(Math.round(by + bh * 1.02f), ct + 2, base.getHeight());
+            int cb = clamp(Math.round(by + bh * 0.92f), ct + 2, base.getHeight());
             if (cr - cl < 40 || cb - ct < 16) return;
             Bitmap plateCrop = Bitmap.createBitmap(base, cl, ct, cr - cl, cb - ct);
-            // upscale small crops: OCR needs roughly 20px of text height
-            if (plateCrop.getHeight() < 120) {
-                float factor = Math.min(4f, 120f / Math.max(1, plateCrop.getHeight()));
+            // Upscale small crops: distant plates need enough character pixels.
+            if (plateCrop.getHeight() < 180) {
+                float factor = Math.min(4f, 180f / Math.max(1, plateCrop.getHeight()));
                 plateCrop = Bitmap.createScaledBitmap(plateCrop,
                         Math.round(plateCrop.getWidth() * factor),
                         Math.round(plateCrop.getHeight() * factor), true);

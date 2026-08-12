@@ -6,8 +6,11 @@ import com.google.mlkit.vision.common.InputImage;
 import com.google.mlkit.vision.text.TextRecognition;
 import com.google.mlkit.vision.text.TextRecognizer;
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions;
+import java.util.Arrays;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
+import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -28,9 +31,19 @@ final class PlateReader {
     }
 
     private static final String TAG = "CamTrack";
-    /** Indonesian format: 1-2 letters, 1-4 digits, 1-3 letters (e.g. DB 8087 KB). */
+    /**
+     * Indonesian format. The suffix is optional because on a distant plate the
+     * large region + number (for example DB 8246) is readable long before the
+     * tiny expiry/suffix row. Requiring a suffix made genuine plates disappear.
+     */
     private static final Pattern PLATE = Pattern.compile(
-            "([A-Z]{1,2})[\\s.\\-]{0,2}(\\d{2,4})[\\s.\\-]{0,2}([A-Z]{1,3})");
+            "([A-Z]{1,2})[\\s.\\-]{0,4}([0-9OQDILSBZ]{2,4})(?:[\\s.\\-]{0,4}([A-Z]{1,3}))?");
+    /** Known Indonesian registration prefixes; prevents ordinary scene text becoming a plate. */
+    private static final Set<String> PREFIXES = new HashSet<>(Arrays.asList(
+            "A", "B", "D", "E", "F", "G", "H", "K", "L", "M", "N", "P", "R", "S", "T", "W", "Z",
+            "AA", "AB", "AD", "AE", "AG", "BA", "BB", "BD", "BE", "BG", "BH", "BK", "BL", "BM",
+            "BN", "BP", "DA", "DB", "DC", "DD", "DE", "DG", "DH", "DK", "DL", "DM", "DN", "DR",
+            "DS", "DT", "DW", "EA", "EB", "ED", "KB", "KH", "KT", "KU", "PA", "PB"));
     /** how many times the same text must be read before it is trusted */
     private static final int VOTES_NEEDED = 2;
 
@@ -105,21 +118,30 @@ final class PlateReader {
     private static String extract(String raw) {
         if (raw == null || raw.isEmpty()) return null;
         String cleaned = raw.toUpperCase()
-                .replace('O', '0')
-                .replace('|', '1')
+                .replace('|', 'I')
+                // OCR frequently puts the suffix on a second line; whitespace is
+                // deliberately retained so both one-line and two-line plates match.
                 .replaceAll("[^A-Z0-9\\s.\\-]", " ");
-        // letters must stay letters in the prefix/suffix groups, so match on a
-        // version where 0 can also be read back as the letter O.
-        Matcher m = PLATE.matcher(cleaned.replaceAll("(?<![0-9])0(?![0-9])", "O"));
+        Matcher m = PLATE.matcher(cleaned);
         while (m.find()) {
             String prefix = m.group(1);
-            String digits = m.group(2);
+            String digits = normalizeDigits(m.group(2));
             String suffix = m.group(3);
-            if (prefix == null || digits == null || suffix == null) continue;
-            if (digits.length() < 2) continue;
-            return prefix + " " + digits + " " + suffix;
+            if (prefix == null || digits == null || !PREFIXES.contains(prefix)) continue;
+            if (digits.length() < 2 || digits.length() > 4) continue;
+            return suffix == null || suffix.isEmpty()
+                    ? prefix + " " + digits
+                    : prefix + " " + digits + " " + suffix;
         }
         return null;
+    }
+
+    /** Correct only the numeric group, never the DB prefix or letter suffix. */
+    private static String normalizeDigits(String value) {
+        if (value == null) return null;
+        return value.replace('O', '0').replace('Q', '0').replace('D', '0')
+                .replace('I', '1').replace('L', '1').replace('S', '5')
+                .replace('B', '8').replace('Z', '2');
     }
 
     synchronized void forget(int trackId) {
